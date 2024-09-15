@@ -2,7 +2,7 @@ import Foundation
 
 private let HeaderRegex = try! NSRegularExpression(pattern: "^([^\r\n:]+): (.*)$", options: [.anchorsMatchLines])
 
-public class SSDPService {
+public class SSDPService: CustomStringConvertible {
     /// The host of service
     public internal(set) var host: String
     /// The headers of the original response
@@ -37,6 +37,10 @@ public class SSDPService {
         self.uniqueServiceName = headers["USN"]
     }
 
+    public var description: String {
+        return "loc: \(self.location!), server: \(self.server!), st: \(self.searchTarget!), usn: \(self.uniqueServiceName!)"
+    }
+
     // MARK: Private functions
     
     /**
@@ -48,7 +52,7 @@ public class SSDPService {
     private func parse(_ response: String) -> [String: String] {
         var result = [String: String]()
         
-        let matches = HeaderRegex.matches(in: response, range: NSRange(location: 0, length: response.utf16.count))
+        let matches = HeaderRegex.matches(in: response, range: NSRange(location: 0, length: response.count))
         for match in matches {
             let keyCaptureGroupIndex = match.range(at: 1)
             let key = (response as NSString).substring(with: keyCaptureGroupIndex)
