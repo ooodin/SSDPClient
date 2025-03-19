@@ -27,10 +27,10 @@ public class SSDPService: CustomStringConvertible {
     */
     init(host: String, response: String) {
         self.host = host
-        
+
         let headers = self.parse(response)
         self.responseHeaders = headers
-        
+
         self.location = headers["LOCATION"]
         self.server = headers["SERVER"]
         self.searchTarget = headers["ST"]
@@ -42,16 +42,16 @@ public class SSDPService: CustomStringConvertible {
     }
 
     // MARK: Private functions
-    
+
     /**
         Parse the discovery response.
-     
+
         - Parameters:
             - response: The discovery response.
      */
     private func parse(_ response: String) -> [String: String] {
         var result = [String: String]()
-        
+
         let matches = HeaderRegex.matches(in: response, range: NSRange(location: 0, length: response.count))
         for match in matches {
             let keyCaptureGroupIndex = match.range(at: 1)
@@ -60,7 +60,7 @@ public class SSDPService: CustomStringConvertible {
             let value = (response as NSString).substring(with: valueCaptureGroupIndex)
             result[key.uppercased()] = value
         }
-        
+
         return result
     }
 }

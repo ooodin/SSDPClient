@@ -3,167 +3,133 @@ import HeliumLogger
 import LoggerAPI
 import Socket
 
-// MARK: Protocols
+public typealias SSDPServiceStream = AsyncThrowingStream<SSDPService, any Error>
 
-/// Delegate for service discovery
-public protocol SSDPDiscoveryDelegate {
-    /// Tells the delegate a requested service has been discovered.
-    func ssdpDiscovery(_ discovery: SSDPDiscovery, didDiscoverService service: SSDPService)
-
-    /// Tells the delegate that the discovery ended due to an error.
-    func ssdpDiscovery(_ discovery: SSDPDiscovery, didFinishWithError error: Error)
-
-    /// Tells the delegate that the discovery has started.
-    func ssdpDiscoveryDidStart(_ discovery: SSDPDiscovery)
-
-    /// Tells the delegate that the discovery has finished.
-    func ssdpDiscoveryDidFinish(_ discovery: SSDPDiscovery)
-}
-
-public extension SSDPDiscoveryDelegate {
-    func ssdpDiscovery(_ discovery: SSDPDiscovery, didDiscoverService service: SSDPService) {}
-
-    func ssdpDiscovery(_ discovery: SSDPDiscovery, didFinishWithError error: Error) {}
-
-    func ssdpDiscoveryDidStart(_ discovery: SSDPDiscovery) {}
-
-    func ssdpDiscoveryDidFinish(_ discovery: SSDPDiscovery) {}
-}
-
-/// SSDP discovery for UPnP devices on the LAN
-public class SSDPDiscovery {
-
-    /// The UDP socket
+public final actor SSDPDiscovery {
     private var sockets: [Socket] = []
+    private var continuation: SSDPServiceStream.Continuation?
 
-    /// Delegate for service discovery
-    public var delegate: SSDPDiscoveryDelegate?
-
-    /// The client is discovering
-    public var isDiscovering: Bool {
-        get {
-            return self.sockets.count > 0
+    public init() {}
+    
+    /**
+     Discover SSDP services for a duration.
+     - Parameters:
+        - duration: The amount of time to wait
+        - searchTarget: The type of the searched service
+        - port: The port to use for discovery
+        - onInterfaces: The network interfaces to use for discovery
+     */
+    public func discoverService(
+        forDuration duration: TimeInterval = 10,
+        searchTarget: String = "ssdp:all",
+        port: Int32 = 1900,
+        onInterfaces: [String?] = [nil]
+    ) -> SSDPServiceStream {
+        SSDPServiceStream { [weak self] continuation in
+            continuation.onTermination = { [weak self] _ in
+                Task {
+                    await self?.stop()
+                }
+            }
+            Task {
+                guard let self else {
+                    continuation.finish()
+                    return
+                }
+                await self.set(continuation: continuation)
+                await self.createSockets(
+                    duration: duration,
+                    searchTarget: searchTarget,
+                    port: port,
+                    onInterfaces: onInterfaces
+                )
+                await self.readResponses()
+            }
+            Task {
+                try await Task.sleep(for: .seconds(duration))
+                await self?.stop()
+            }
         }
     }
     
-    // MARK: Initialisation
-
-    public init() {
-        HeliumLogger.use()
-    }
-
-    deinit {
-        self.stop()
-    }
-
-    // MARK: Private functions
-
-    /// Read responses.
-    private func readResponses() {
-        for socket in self.sockets {
-            do {
-                var data = Data()
-                let (bytesRead, address) = try socket.readDatagram(into: &data)
-
-                if bytesRead > 0 {
-                    let response = String(data: data, encoding: .utf8)
-                    let (remoteHost, _) = Socket.hostnameAndPort(from: address!)!
-                    Log.debug("Received: \(response!) from \(remoteHost)")
-                    self.delegate?.ssdpDiscovery(self, didDiscoverService: SSDPService(host: remoteHost, response: response!))
-                }
-
-            } catch let error {
-                Log.error("Socket error: \(error)")
-                self.forceStop()
-                self.delegate?.ssdpDiscovery(self, didFinishWithError: error)
-            }
+    public func stop() {
+        continuation?.finish()
+        continuation = nil
+        
+        while sockets.isEmpty == false {
+            sockets.removeLast().close()
         }
     }
+}
 
-    /// Read responses with timeout.
-    private func readResponses(forDuration duration: TimeInterval) {
-        let queue = DispatchQueue.global()
-
-        queue.async() {
-            while self.isDiscovering {
-                self.readResponses()
-            }
-        }
-
-        queue.asyncAfter(deadline: .now() + duration) { [unowned self] in
-            self.stop()
-        }
+private extension SSDPDiscovery {
+    private func set(continuation: SSDPServiceStream.Continuation) {
+        self.continuation = continuation
     }
-
-    /// Force stop discovery closing the socket.
-    private func forceStop() {
-        while self.isDiscovering {
-            self.sockets.removeLast().close()
-        }
-    }
-
-    // MARK: Public functions
-
-    /**
-        Discover SSDP services for a duration.
-        - Parameters:
-            - duration: The amount of time to wait.
-            - searchTarget: The type of the searched service.
-    */
-    open func discoverService(forDuration duration: TimeInterval = 10, searchTarget: String = "ssdp:all", port: Int32 = 1900, onInterfaces:[String?] = [nil]) {
-        Log.info("Start SSDP discovery for \(Int(duration)) duration...")
-        self.delegate?.ssdpDiscoveryDidStart(self)
-
+    
+    private func createSockets(
+        duration: TimeInterval,
+        searchTarget: String = "ssdp:all",
+        port: Int32 = 1900,
+        onInterfaces: [String?] = [nil]
+    ) async {
+        // Setup sockets for each interface
         for interface in onInterfaces {
             var socket: Socket? = nil
             do {
-                // Determine the multicase address based on the interface's address type (ipv4 vs ipv6)
-                let interfaceAddr = Socket.createAddress(for: interface ?? "127.0.0.1", on: 0)
+                let defaultAddress = "127.0.0.1"
+                let addressToUse = interface ?? defaultAddress
+                let interfaceAddr = Socket.createAddress(for: addressToUse, on: 0)
                 let multicastAddr: String
                 let family: Socket.ProtocolFamily
-                switch interfaceAddr {
-                    case .ipv6?:
-                        multicastAddr = "ff02::c"   // use "ff02::c" for "link-local" or "ff05::c" for "site-local"
-                        family = .inet6
-                    default:
-                        multicastAddr = "239.255.255.250"
-                        family = .inet
+                
+                if case .ipv6? = interfaceAddr {
+                    multicastAddr = "ff02::c"
+                    family = .inet6
+                } else {
+                    multicastAddr = "239.255.255.250"
+                    family = .inet
                 }
                 socket = try Socket.create(family: family, type: .datagram, proto: .udp)
-                if let socket = socket {
-                    try socket.listen(on: 0, node: interface)   // node:nil means the default interface, for all others it should be the interface's IP address
-                    // Use Multicast (Caution: Gets blocked by iOS 16 unless the app has the multicast entitlement!)
-                    let message = "M-SEARCH * HTTP/1.1\r\n" +
-                        "MAN: \"ssdp:discover\"\r\n" +
-                        "HOST: \(multicastAddr):\(port)\r\n" +
-                        "ST: \(searchTarget)\r\n" +
-                        "MX: \(Int(duration))\r\n\r\n"
-                    try socket.write(from: message, to: Socket.createAddress(for: multicastAddr, on: port)!)
-                    self.sockets.append(socket)
+                
+                guard let socket = socket else {
+                    continue
                 }
-            } catch let error {
-                // We ignore errors here because we get "-9980(0x-26FC), No route to host" if we're not allowed to multicast, and that's difficult to foresee.
-                // Also, with multiple interfaces, some may fail, and we need to ignore that, too, or it gets too difficult to handle for the caller
-                // to sort out which work and which don't.
-                socket?.close();
+                try socket.listen(on: 0, node: interface)
+                let message =
+                "M-SEARCH * HTTP/1.1\r\n" + "MAN: \"ssdp:discover\"\r\n" + "HOST: \(multicastAddr):\(port)\r\n"
+                + "ST: \(searchTarget)\r\n" + "MX: \(Int(duration))\r\n\r\n"
+                try socket.write(from: message, to: Socket.createAddress(for: multicastAddr, on: port)!)
+                sockets.append(socket)
+            } catch {
+                socket?.close()
                 Log.info("Socket error: \(error) on interface \(interface ?? "default")")
             }
         }
-
-        if !self.isDiscovering {    // Might we run into a race condition here?
-            //Log.info("Failed SSDP discovery")
-            self.delegate?.ssdpDiscoveryDidFinish(self)
-        } else {
-            self.readResponses(forDuration: duration)
-        }
     }
     
-    /// Stop the discovery before the timeout.
-    open func stop() {
-        if self.isDiscovering {
-            Log.info("Stop SSDP discovery")
-            self.forceStop()
-            self.delegate?.ssdpDiscoveryDidFinish(self)
+    /// Read responses from all sockets
+    private func readResponses() async {
+        for socket in sockets {
+            do {
+                var data = Data()
+                let (bytesRead, address) = try socket.readDatagram(into: &data)
+                
+                guard
+                    bytesRead > 0,
+                    let response = String(data: data, encoding: .utf8),
+                    let address = address,
+                    let (remoteHost, _) = Socket.hostnameAndPort(from: address)
+                else {
+                    continue
+                }
+                Log.debug("Received: \(response) from \(remoteHost)")
+                
+                let service = SSDPService(host: remoteHost, response: response)
+                continuation?.yield(service)
+            } catch {
+                Log.error("Socket error: \(error)")
+            }
         }
     }
 }

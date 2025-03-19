@@ -1,4 +1,5 @@
 import XCTest
+
 @testable import SSDPClient
 
 let duration: TimeInterval = 5
@@ -8,7 +9,7 @@ class SSDPDiscoveryTests: XCTestCase {
         ("testDiscoverService", testDiscoverService),
         ("testStop", testStop),
     ]
-    
+
     let client = SSDPDiscovery()
 
     var discoverServiceExpectation: XCTestExpectation?
